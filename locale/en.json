@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Antigravity (agy) LLM provider",
+    "description": "Use your local logged-in Google Antigravity CLI (agy) models in DeepSeek Harness without an API key or baseURL."
+  }
+}

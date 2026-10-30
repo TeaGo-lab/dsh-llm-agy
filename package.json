@@ -1,0 +1,46 @@
+{
+  "name": "dsh-llm-agy",
+  "version": "0.1.0",
+  "description": "Google Antigravity (agy CLI) LLM provider bundle for DeepSeek Harness — zero API key or baseURL required.",
+  "author": "TeaGo-lab",
+  "license": "MIT",
+  "homepage": "https://github.com/TeaGo-lab/dsh-llm-agy#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TeaGo-lab/dsh-llm-agy.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "cordis",
+    "antigravity",
+    "agy",
+    "llm-adapter"
+  ],
+  "type": "module",
+  "icon": "./icon.svg",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

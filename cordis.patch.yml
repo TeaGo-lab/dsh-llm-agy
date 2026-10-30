@@ -1,0 +1,8 @@
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: agy
+    model: gemini-4-argon-high
+- insert:
+    - id: llm-agy
+      name: dsh-llm-agy

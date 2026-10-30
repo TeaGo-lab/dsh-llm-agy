@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Antigravity (agy) 模型提供方",
+    "description": "在 DeepSeek Harness 中直接使用本机已登录的 Google Antigravity CLI (agy) 模型，无需 API Key 或 baseURL。"
+  }
+}
