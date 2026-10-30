@@ -5,19 +5,19 @@ import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const DEFAULT_AGY_MODELS = [
-  { id: 'gemini-4-argon-high', displayName: 'Gemini 4 Argon (High)' },
-  { id: 'gemini-4-argon-medium', displayName: 'Gemini 4 Argon (Medium)' },
-  { id: 'gemini-4-argon-low', displayName: 'Gemini 4 Argon (Low)' },
-  { id: 'gemini-3.8-flash-high', displayName: 'Gemini 3.8 Flash (High)' },
-  { id: 'gemini-3.8-flash-medium', displayName: 'Gemini 3.8 Flash (Medium)' },
-  { id: 'gemini-3.8-flash-low', displayName: 'Gemini 3.8 Flash (Low)' },
-  { id: 'claude-opus-5-5-high', displayName: 'Claude Opus 5.5 (High)' },
-  { id: 'claude-opus-5-5-medium', displayName: 'Claude Opus 5.5 (Medium)' },
-  { id: 'claude-opus-5-5-low', displayName: 'Claude Opus 5.5 (Low)' },
-  { id: 'claude-sonnet-5-5-high', displayName: 'Claude Sonnet 5.5 (High)' },
-  { id: 'claude-sonnet-5-5-medium', displayName: 'Claude Sonnet 5.5 (Medium)' },
-  { id: 'claude-sonnet-5-5-low', displayName: 'Claude Sonnet 5.5 (Low)' },
-  { id: 'gpt-oss-120b-medium', displayName: 'GPT-OSS 120B (Medium)' },
+  { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+  { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+  { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
+  { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+  { id: 'gemini-3.8-flash-medium', name: 'Gemini 3.8 Flash (Medium)' },
+  { id: 'gemini-3.8-flash-low', name: 'Gemini 3.8 Flash (Low)' },
+  { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+  { id: 'claude-opus-5-5-medium', name: 'Claude Opus 5.5 (Medium)' },
+  { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+  { id: 'claude-sonnet-5-5-high', name: 'Claude Sonnet 5.5 (High)' },
+  { id: 'claude-sonnet-5-5-medium', name: 'Claude Sonnet 5.5 (Medium)' },
+  { id: 'claude-sonnet-5-5-low', name: 'Claude Sonnet 5.5 (Low)' },
+  { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
 ]
 
 function resolveDefaultAgyBin() {
@@ -132,6 +132,25 @@ class AgyLlmAdapter {
     this.cachedModels = null
   }
 
+  providerInfo(provider) {
+    return {
+      id: provider,
+      name: 'Google Antigravity (agy)',
+    }
+  }
+
+  providerRetryPolicy(_provider) {
+    return undefined
+  }
+
+  imageRequestPricing(_provider, _model) {
+    return undefined
+  }
+
+  imageRequestTarget(_provider, _model, image) {
+    return { width: image.width, height: image.height, maxBytes: image.bytes }
+  }
+
   async discoverModels(signal) {
     if (this.cachedModels) return this.cachedModels
     return await new Promise((resolve) => {
@@ -154,7 +173,7 @@ class AgyLlmAdapter {
           const trimmed = line.trim()
           if (!trimmed) continue
           const [id, displayName] = trimmed.split('\t')
-          if (id) parsed.push({ id: id.trim(), displayName: (displayName ?? id).trim() })
+          if (id) parsed.push({ id: id.trim(), name: (displayName ?? id).trim() })
         }
         if (parsed.length > 0) {
           this.cachedModels = parsed
@@ -166,13 +185,12 @@ class AgyLlmAdapter {
     })
   }
 
-  async listModels(signal) {
-    const models = await this.discoverModels(signal)
+  async listModels(provider) {
+    const models = await this.discoverModels()
     return models.map(m => ({
-      provider: this.provider,
+      provider: provider || this.provider,
       id: m.id,
-      displayName: m.displayName,
-      context: { maxInputTokens: 200_000, maxOutputTokens: 32_768 },
+      name: m.name,
     }))
   }
 
@@ -180,23 +198,19 @@ class AgyLlmAdapter {
     const models = await this.discoverModels(signal)
     const found = models.find(m => m.id === model)
     return {
-      provider,
+      provider: provider || this.provider,
       id: model,
-      displayName: found?.displayName ?? model,
-      context: { maxInputTokens: 200_000, maxOutputTokens: 32_768 },
+      name: found?.name ?? model,
+      context: { contextWindow: 200_000 },
+      defaultMaxTokens: 32_768,
     }
   }
 
-  async generate(options) {
-    const content = []
-    let usage = { inputTokens: 0, outputTokens: 0 }
-    let stopReason = { kind: 'stop' }
-    for await (const chunk of this.stream(options)) {
-      if (chunk.type === 'block-end') content.push(chunk.block)
-      else if (chunk.type === 'usage') usage = chunk.usage
-      else if (chunk.type === 'finish') stopReason = chunk.reason
+  async prepareCall(provider, model, signal) {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: options => this.stream(options),
     }
-    return { content, usage, stopReason }
   }
 
   async *stream(options) {
@@ -362,12 +376,4 @@ export function apply(ctx, config = {}) {
   const provider = config.provider || 'agy'
   const adapter = new AgyLlmAdapter(agyBin, provider)
   ctx.llm.registerAdapter([provider], adapter)
-  for (const m of DEFAULT_AGY_MODELS) {
-    ctx.llm.registerModel({
-      provider,
-      id: m.id,
-      displayName: m.displayName,
-      context: { maxInputTokens: 200_000, maxOutputTokens: 32_768 },
-    })
-  }
 }
