@@ -8,6 +8,7 @@ Use your local logged-in **Google Antigravity CLI (`agy`)** models directly insi
 
 - **Zero API Key / BaseURL:** Reuses your existing local `agy` CLI authentication session.
 - **Full Model Selector Integration:** Automatically registers the `agy` provider and all 13 Antigravity models (`gemini-4-argon-high`, `claude-opus-5-5-high`, `claude-sonnet-5-5-high`, `gemini-3.8-flash-high`, `gpt-oss-120b-medium`, etc.) in the DeepSeek Harness Web UI and CLI.
+- **Automatic Windows System Proxy & Retry:** Automatically reads the Windows system proxy (`HKCU\...\Internet Settings`) when `HTTP_PROXY` / `HTTPS_PROXY` are not set in `process.env`, and retries transient OAuth/EOF network errors (`googleapis.com/oauth2/v2/userinfo`).
 - **Real-time Streaming & Tool Calling:** Bridges `agy --output-format stream-json` NDJSON streaming and `<dsh_tool_call>` multi-turn tool invocations into native `dsh` `StreamChunk` events.
 - **Hot-Plug Bundle:** Standard DSH Plugin Bundle (`dsh.bundle.patch`), installable directly from the DSH Web UI (**Plugins → Add plugin**) or CLI (`dsh plugin add`).
 
@@ -34,7 +35,7 @@ Use your local logged-in **Google Antigravity CLI (`agy`)** models directly insi
      *(or `github:TeaGo-lab/dsh-llm-agy`)*
    - **From a local clone (absolute path):**
      ```text
-     E:\GitProject\dsh-llm-agy
+     D:\AppProject\dsh-llm-agy
      ```
 5. Once installed, click **Enable now (立即启用)**.
 6. Open the model selector in the chat composer and pick any **agy** model (defaults to `Gemini 4 Argon (High)`).
@@ -46,7 +47,7 @@ Use your local logged-in **Google Antigravity CLI (`agy`)** models directly insi
 dsh plugin --profile web add https://github.com/TeaGo-lab/dsh-llm-agy
 
 # Or install from a local directory
-dsh plugin --profile web add E:\GitProject\dsh-llm-agy
+dsh plugin --profile web add D:\AppProject\dsh-llm-agy
 ```
 
 ## Supported Models
