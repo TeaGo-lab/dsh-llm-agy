@@ -96,14 +96,36 @@ function buildAgySpawnEnv(configuredProxy) {
 
 const EMPTY_CWD = join(tmpdir(), 'dsh-agy-llm-empty')
 
-async function formatContent(content, stageImageFn) {
-  if (typeof content === 'string') return content
+function sanitizeAgyLeakage(rawText) {
+  if (typeof rawText !== 'string' || !rawText) return ''
+  let s = rawText
+  // If agy leaked internal CDATA thought delimiters (`]]>`), strip everything up to the last `]]>`
+  if (s.includes(']]>')) {
+    const lastCdataClose = s.lastIndexOf(']]>')
+    s = s.slice(lastCdataClose + 3)
+  }
+  // Strip self-talk lines referencing <dsh_tool_call> tags in prose
+  s = s.replace(/^[^\n]*<dsh_tool_call>[^\n{]*$/gm, '')
+  // Strip stray partial `<dsh` or `<dsh_` artifacts from earlier turns
+  s = s.replace(/^\s*<dsh_[a-z_]*\s*$/gm, '').replace(/^\s*<dsh\s*$/gm, '')
+  return s.trim()
+}
+
+async function formatContent(content, stageImageFn, role = 'user') {
+  if (typeof content === 'string') {
+    return role === 'assistant' ? sanitizeAgyLeakage(content) : content
+  }
   if (!Array.isArray(content)) return ''
   const parts = []
   for (const block of content) {
     if (!block || typeof block !== 'object') continue
     if (block.type === 'text' && typeof block.text === 'string') {
-      parts.push(block.text)
+      const text = role === 'assistant'
+        ? extractToolCalls(block.text).cleanText
+        : block.text
+      if (text.trim()) {
+        parts.push(text)
+      }
     } else if (block.type === 'image' && block.attachment && typeof stageImageFn === 'function') {
       const stagedPath = await stageImageFn(block.attachment)
       if (stagedPath) {
@@ -111,10 +133,6 @@ async function formatContent(content, stageImageFn) {
           `[ATTACHED_IMAGE: ${stagedPath} — Call your built-in read_file tool with {"Path": ${JSON.stringify(stagedPath)}} to view this image visually before responding]`,
         )
       }
-    } else if (block.type === 'reasoning' && typeof block.text === 'string') {
-      parts.push(`<thinking>\n${block.text}\n</thinking>`)
-    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
-      parts.push(`<thinking>\n${block.thinking}\n</thinking>`)
     } else if (block.type === 'tool-call') {
       parts.push(`<dsh_tool_call>{"name":${JSON.stringify(block.name)},"arguments":${block.arguments}}</dsh_tool_call>`)
     }
@@ -129,9 +147,9 @@ async function buildPrompt(options, stageImageFn) {
     '# DeepSeek Harness LLM Bridge Instructions',
     'You are acting as the underlying LLM engine for DeepSeek Harness (dsh).',
     'IMPORTANT: Do NOT invoke your own built-in Antigravity CLI tools (such as run_command, write_file, edit_file, etc.) for workspace operations, EXCEPT that when a message contains `[ATTACHED_IMAGE: <path>]`, you MUST call your built-in `read_file` tool on that exact `<path>` to inspect the image visually before responding.',
-    'For all other dsh workspace operations, output one or more XML blocks in the exact format:',
+    'For all other dsh workspace operations, output ONLY one or more XML blocks in the exact format (with no commentary before or after):',
     '<dsh_tool_call>{"name": "tool_name", "arguments": {...}}</dsh_tool_call>',
-    'When you emit a <dsh_tool_call> block, stop immediately after emitting the tool call(s) so dsh can execute them and return the <dsh_tool_result> in the next turn.',
+    'When you emit a <dsh_tool_call> block, output nothing else in that turn so dsh can execute the tool and return <dsh_tool_result>.',
   )
 
   const rawSystem = options.system ?? options.systemPrompt
@@ -156,35 +174,37 @@ async function buildPrompt(options, stageImageFn) {
   const transcript = []
   for (const msg of options.messages || []) {
     if (msg.role === 'system') {
-      transcript.push(`[SYSTEM]\n${await formatContent(msg.content, stageImageFn)}`)
+      transcript.push(`[SYSTEM]\n${await formatContent(msg.content, stageImageFn, 'system')}`)
     } else if (msg.role === 'developer') {
-      const devText = await formatContent(msg.content, stageImageFn)
+      const devText = await formatContent(msg.content, stageImageFn, 'developer')
       if (devText.trim()) transcript.push(`[DEVELOPER]\n${devText}`)
     } else if (msg.role === 'user') {
-      transcript.push(`[USER]\n${await formatContent(msg.content, stageImageFn)}`)
+      transcript.push(`[USER]\n${await formatContent(msg.content, stageImageFn, 'user')}`)
     } else if (msg.role === 'assistant') {
-      transcript.push(`[ASSISTANT]\n${await formatContent(msg.content, stageImageFn)}`)
+      const asstText = await formatContent(msg.content, stageImageFn, 'assistant')
+      if (asstText.trim()) transcript.push(`[ASSISTANT]\n${asstText}`)
     } else if (msg.role === 'tool') {
-      const text = await formatContent(msg.content, stageImageFn)
+      const text = await formatContent(msg.content, stageImageFn, 'tool')
       transcript.push(
         `[TOOL RESULT (toolCallId=${msg.toolCallId}${msg.isError ? ', error=true' : ''})]\n<dsh_tool_result>\n${text}\n</dsh_tool_result>`,
       )
     }
   }
 
-  sections.push(`# Conversation History\n${transcript.join('\n\n')}\n\n[ASSISTANT]`)
+  sections.push(`# Conversation History\n${transcript.join('\n\n')}`)
   return sections.join('\n\n')
 }
 
 function extractToolCalls(rawText) {
   const toolCalls = []
-  const regex = /<dsh_tool_call>\s*([\s\S]*?)\s*<\/dsh_tool_call>/g
-  let cleanText = ''
+  // Match <dsh_tool_call>{...}</dsh_tool_call> where the body starts with `{` and doesn't cross another <dsh_tool_call>
+  const regex = /<dsh_tool_call>\s*(\{(?:(?!<dsh_tool_call>)[\s\S])*?\})\s*<\/dsh_tool_call>/g
+  let stripped = ''
   let lastIndex = 0
   let match
 
   while ((match = regex.exec(rawText)) !== null) {
-    cleanText += rawText.slice(lastIndex, match.index)
+    stripped += rawText.slice(lastIndex, match.index)
     lastIndex = regex.lastIndex
     const payload = (match[1] ?? '').trim()
     try {
@@ -196,11 +216,46 @@ function extractToolCalls(rawText) {
         toolCalls.push({ name: parsed.name, arguments: argsStr })
       }
     } catch {
-      cleanText += match[0]
+      // Ignore malformed tool call JSON rather than dumping raw XML into user-visible text
     }
   }
-  cleanText += rawText.slice(lastIndex)
-  return { cleanText: cleanText.trim(), toolCalls }
+  stripped += rawText.slice(lastIndex)
+  let cleanText = sanitizeAgyLeakage(stripped)
+  // If this turn is invoking tools and the remaining text had leaked CDATA `]]>` or `<dsh_tool_call`, suppress the leaked pre-tool monologue
+  if (toolCalls.length > 0 && (rawText.includes(']]>') || stripped.includes('<dsh_tool_call'))) {
+    cleanText = ''
+  }
+  return { cleanText, toolCalls }
+}
+
+function computeSafeStreamablePrefix(fullResponse) {
+  if (!fullResponse) return ''
+  // Never stream if CDATA thought leakage `]]>` or `<dsh_tool_call` is present
+  if (fullResponse.includes(']]>') || fullResponse.includes('<dsh_tool_call')) {
+    const idx = fullResponse.indexOf('<dsh_tool_call')
+    const before = idx >= 0 ? fullResponse.slice(0, idx) : ''
+    return sanitizeAgyLeakage(before)
+  }
+  const trimmedStart = fullResponse.trimStart()
+  // If response starts with `<`, hold back until we know it's not `<dsh_tool_call>`
+  if (trimmedStart.startsWith('<')) {
+    if ('<dsh_tool_call>'.startsWith(trimmedStart) || trimmedStart.startsWith('<dsh')) {
+      return ''
+    }
+  }
+  // Hold back any trailing `<` suffix at the end of fullResponse that could be the start of `<dsh_tool_call>`
+  const lastLt = fullResponse.lastIndexOf('<')
+  if (lastLt >= 0 && fullResponse.length - lastLt <= 16) {
+    const tail = fullResponse.slice(lastLt)
+    if ('<dsh_tool_call>'.startsWith(tail)) {
+      return fullResponse.slice(0, lastLt)
+    }
+  }
+  // Also hold back the very first 48 ASCII chars if they look like an English thought header before `]]>`
+  if (fullResponse.length < 64 && /^[A-Za-z0-9_\s,\].:-]+$/.test(fullResponse)) {
+    return ''
+  }
+  return fullResponse
 }
 
 function isRetryableAgyError(stderrText) {
@@ -430,13 +485,17 @@ class AgyLlmAdapter {
             }
             if (step.step_type === 'agent_response' && typeof step.text_delta === 'string' && step.text_delta.length > 0) {
               fullResponse += step.text_delta
-              if (!fullResponse.includes('<dsh_tool_call')) {
-                if (!textBlockStarted) {
-                  textBlockStarted = true
-                  yield { type: 'block-start', index: 0, blockType: 'text' }
+              const safePrefix = computeSafeStreamablePrefix(fullResponse)
+              if (safePrefix.length > streamedText.length && safePrefix.startsWith(streamedText)) {
+                const newDelta = safePrefix.slice(streamedText.length)
+                if (newDelta.length > 0) {
+                  if (!textBlockStarted) {
+                    textBlockStarted = true
+                    yield { type: 'block-start', index: 0, blockType: 'text' }
+                  }
+                  streamedText = safePrefix
+                  yield { type: 'text-delta', index: 0, text: newDelta }
                 }
-                streamedText += step.text_delta
-                yield { type: 'text-delta', index: 0, text: step.text_delta }
               }
             }
           } else if (parsed.event === 'result' && parsed.result) {
@@ -475,10 +534,16 @@ class AgyLlmAdapter {
         let nextIndex = 0
 
         if (textBlockStarted) {
+          if (cleanText.length > streamedText.length && cleanText.startsWith(streamedText)) {
+            const remainingDelta = cleanText.slice(streamedText.length)
+            if (remainingDelta.length > 0) {
+              yield { type: 'text-delta', index: 0, text: remainingDelta }
+            }
+          }
           yield {
             type: 'block-end',
             index: 0,
-            block: { type: 'text', text: cleanText || streamedText },
+            block: { type: 'text', text: cleanText },
           }
           nextIndex = 1
         } else if (cleanText.length > 0) {
