@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -96,7 +96,7 @@ function buildAgySpawnEnv(configuredProxy) {
 
 const EMPTY_CWD = join(tmpdir(), 'dsh-agy-llm-empty')
 
-function formatContent(content) {
+async function formatContent(content, stageImageFn) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
   const parts = []
@@ -104,6 +104,13 @@ function formatContent(content) {
     if (!block || typeof block !== 'object') continue
     if (block.type === 'text' && typeof block.text === 'string') {
       parts.push(block.text)
+    } else if (block.type === 'image' && block.attachment && typeof stageImageFn === 'function') {
+      const stagedPath = await stageImageFn(block.attachment)
+      if (stagedPath) {
+        parts.push(
+          `[ATTACHED_IMAGE: ${stagedPath} — Call your built-in read_file tool with {"Path": ${JSON.stringify(stagedPath)}} to view this image visually before responding]`,
+        )
+      }
     } else if (block.type === 'reasoning' && typeof block.text === 'string') {
       parts.push(`<thinking>\n${block.text}\n</thinking>`)
     } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
@@ -115,14 +122,14 @@ function formatContent(content) {
   return parts.join('\n')
 }
 
-function buildPrompt(options) {
+async function buildPrompt(options, stageImageFn) {
   const sections = []
 
   sections.push(
     '# DeepSeek Harness LLM Bridge Instructions',
     'You are acting as the underlying LLM engine for DeepSeek Harness (dsh).',
-    'IMPORTANT: Do NOT invoke your own built-in Antigravity CLI tools (such as run_command, read_file, write_file, edit_file, view_file, etc.).',
-    'Instead, respond directly to the conversation below. When you need to call one of the provided dsh tools, output one or more XML blocks in the exact format:',
+    'IMPORTANT: Do NOT invoke your own built-in Antigravity CLI tools (such as run_command, write_file, edit_file, etc.) for workspace operations, EXCEPT that when a message contains `[ATTACHED_IMAGE: <path>]`, you MUST call your built-in `read_file` tool on that exact `<path>` to inspect the image visually before responding.',
+    'For all other dsh workspace operations, output one or more XML blocks in the exact format:',
     '<dsh_tool_call>{"name": "tool_name", "arguments": {...}}</dsh_tool_call>',
     'When you emit a <dsh_tool_call> block, stop immediately after emitting the tool call(s) so dsh can execute them and return the <dsh_tool_result> in the next turn.',
   )
@@ -149,20 +156,16 @@ function buildPrompt(options) {
   const transcript = []
   for (const msg of options.messages || []) {
     if (msg.role === 'system') {
-      transcript.push(`[SYSTEM]\n${formatContent(msg.content)}`)
+      transcript.push(`[SYSTEM]\n${await formatContent(msg.content, stageImageFn)}`)
     } else if (msg.role === 'developer') {
-      const devText = formatContent(msg.content)
+      const devText = await formatContent(msg.content, stageImageFn)
       if (devText.trim()) transcript.push(`[DEVELOPER]\n${devText}`)
     } else if (msg.role === 'user') {
-      transcript.push(`[USER]\n${formatContent(msg.content)}`)
+      transcript.push(`[USER]\n${await formatContent(msg.content, stageImageFn)}`)
     } else if (msg.role === 'assistant') {
-      transcript.push(`[ASSISTANT]\n${formatContent(msg.content)}`)
+      transcript.push(`[ASSISTANT]\n${await formatContent(msg.content, stageImageFn)}`)
     } else if (msg.role === 'tool') {
-      const text = typeof msg.content === 'string'
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map(p => (p.type === 'text' ? p.text : '[image]')).join('\n')
-          : ''
+      const text = await formatContent(msg.content, stageImageFn)
       transcript.push(
         `[TOOL RESULT (toolCallId=${msg.toolCallId}${msg.isError ? ', error=true' : ''})]\n<dsh_tool_result>\n${text}\n</dsh_tool_result>`,
       )
@@ -231,11 +234,44 @@ function delayMs(ms, signal) {
 }
 
 class AgyLlmAdapter {
-  constructor(agyBin, provider, proxyUrl) {
+  constructor(ctx, agyBin, provider, proxyUrl) {
+    this.ctx = ctx
     this.agyBin = agyBin
     this.provider = provider
     this.proxyUrl = proxyUrl
     this.cachedModels = null
+  }
+
+  async stageImageAttachment(attachment, signal) {
+    try {
+      const attachmentsSvc = this.ctx?.get?.('attachments') ?? this.ctx?.attachments
+      if (!attachmentsSvc || !attachment) return null
+      const ext = attachment.mediaType === 'image/png' ? 'png'
+        : attachment.mediaType === 'image/webp' ? 'webp'
+        : attachment.mediaType === 'image/gif' ? 'gif'
+        : 'jpg'
+      const safeId = String(attachment.attachmentId || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24)
+      const destPath = join(EMPTY_CWD, `img-${safeId}.${ext}`)
+      if (existsSync(destPath)) return destPath
+
+      if (typeof attachmentsSvc.imageHostPath === 'function') {
+        const hostPath = attachmentsSvc.imageHostPath(attachment)
+        if (hostPath && existsSync(hostPath)) {
+          copyFileSync(hostPath, destPath)
+          return destPath
+        }
+      }
+      if (typeof attachmentsSvc.readImage === 'function') {
+        const stored = await attachmentsSvc.readImage(attachment, signal)
+        if (stored?.data) {
+          writeFileSync(destPath, stored.data)
+          return destPath
+        }
+      }
+    } catch {
+      // Fall through if image staging fails
+    }
+    return null
   }
 
   providerInfo(provider) {
@@ -298,6 +334,7 @@ class AgyLlmAdapter {
       provider: provider || this.provider,
       id: m.id,
       name: m.name,
+      inputModalities: ['text', 'image'],
     }))
   }
 
@@ -308,6 +345,7 @@ class AgyLlmAdapter {
       provider: provider || this.provider,
       id: model,
       name: found?.name ?? model,
+      inputModalities: ['text', 'image'],
       context: { contextWindow: 200_000 },
       defaultMaxTokens: 32_768,
     }
@@ -322,7 +360,7 @@ class AgyLlmAdapter {
 
   async *stream(options) {
     mkdirSync(EMPTY_CWD, { recursive: true })
-    const prompt = buildPrompt(options)
+    const prompt = await buildPrompt(options, att => this.stageImageAttachment(att, options.signal))
     const args = [
       '--output-format',
       'stream-json',
@@ -507,6 +545,6 @@ export function apply(ctx, config = {}) {
   const agyBin = config.agyBin || resolveDefaultAgyBin()
   const provider = config.provider || 'agy'
   const proxyUrl = config.proxyUrl || config.proxy || undefined
-  const adapter = new AgyLlmAdapter(agyBin, provider, proxyUrl)
+  const adapter = new AgyLlmAdapter(ctx, agyBin, provider, proxyUrl)
   ctx.effect(() => ctx.llm.registerAdapter([provider], adapter))
 }
