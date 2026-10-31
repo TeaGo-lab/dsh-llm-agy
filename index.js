@@ -134,7 +134,7 @@ async function formatContent(content, stageImageFn, role = 'user') {
         )
       }
     } else if (block.type === 'tool-call') {
-      parts.push(`<dsh_tool_call>{"name":${JSON.stringify(block.name)},"arguments":${block.arguments}}</dsh_tool_call>`)
+      parts.push(`<dsh_tool_call>{"id":${JSON.stringify(block.id || '')},"name":${JSON.stringify(block.name)},"arguments":${block.arguments}}</dsh_tool_call>`)
     }
   }
   return parts.join('\n')
@@ -171,6 +171,17 @@ async function buildPrompt(options, stageImageFn) {
     sections.push(`# Available dsh Tools (JSON Schema)\n\`\`\`json\n${JSON.stringify(toolDefs, null, 2)}\n\`\`\``)
   }
 
+  const toolCallById = new Map()
+  for (const msg of options.messages || []) {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block && block.type === 'tool-call' && block.id) {
+          toolCallById.set(block.id, { name: block.name, arguments: block.arguments })
+        }
+      }
+    }
+  }
+
   const transcript = []
   for (const msg of options.messages || []) {
     if (msg.role === 'system') {
@@ -185,8 +196,12 @@ async function buildPrompt(options, stageImageFn) {
       if (asstText.trim()) transcript.push(`[ASSISTANT]\n${asstText}`)
     } else if (msg.role === 'tool') {
       const text = await formatContent(msg.content, stageImageFn, 'tool')
+      const callMeta = toolCallById.get(msg.toolCallId)
+      const metaLabel = callMeta
+        ? `toolCallId=${msg.toolCallId}, tool=${callMeta.name}, arguments=${callMeta.arguments}`
+        : `toolCallId=${msg.toolCallId}`
       transcript.push(
-        `[TOOL RESULT (toolCallId=${msg.toolCallId}${msg.isError ? ', error=true' : ''})]\n<dsh_tool_result>\n${text}\n</dsh_tool_result>`,
+        `[TOOL RESULT (${metaLabel}${msg.isError ? ', error=true' : ''})]\n<dsh_tool_result>\n${text}\n</dsh_tool_result>`,
       )
     }
   }
@@ -390,6 +405,8 @@ class AgyLlmAdapter {
       id: m.id,
       name: m.name,
       inputModalities: ['text', 'image'],
+      context: { contextWindow: 1_000_000 },
+      defaultMaxTokens: 65_536,
     }))
   }
 
@@ -401,8 +418,8 @@ class AgyLlmAdapter {
       id: model,
       name: found?.name ?? model,
       inputModalities: ['text', 'image'],
-      context: { contextWindow: 200_000 },
-      defaultMaxTokens: 32_768,
+      context: { contextWindow: 1_000_000 },
+      defaultMaxTokens: 65_536,
     }
   }
 
