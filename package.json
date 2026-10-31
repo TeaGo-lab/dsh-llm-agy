@@ -1,7 +1,7 @@
 {
   "name": "dsh-llm-agy",
-  "version": "0.1.1",
-  "description": "Google Antigravity (agy CLI) LLM provider bundle for DeepSeek Harness — zero API key or baseURL required.",
+  "version": "0.1.2",
+  "description": "Google Antigravity (agy CLI) LLM provider bundle for DeepSeek Harness 鈥?zero API key or baseURL required.",
   "author": "TeaGo-lab",
   "license": "MIT",
   "homepage": "https://github.com/TeaGo-lab/dsh-llm-agy#readme",

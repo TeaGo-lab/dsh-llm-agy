@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -29,15 +29,84 @@ function resolveDefaultAgyBin() {
   return 'agy'
 }
 
+let cachedWinProxy = null
+let cachedWinProxyAt = 0
+
+/**
+ * Detect Windows system proxy from HKCU Internet Settings when HTTP_PROXY / HTTPS_PROXY
+ * are not explicitly set in process.env, ensuring the Go-based `agy` binary can reach
+ * Google OAuth (`googleapis.com/oauth2/v2/userinfo`) and model endpoints reliably.
+ */
+function detectWindowsSystemProxy() {
+  if (process.platform !== 'win32') return undefined
+  const now = Date.now()
+  if (now - cachedWinProxyAt < 30_000) {
+    return cachedWinProxy || undefined
+  }
+  cachedWinProxyAt = now
+  try {
+    const out = execFileSync(
+      'reg.exe',
+      ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+      { encoding: 'utf8', windowsHide: true, timeout: 2500, stdio: ['ignore', 'pipe', 'ignore'] },
+    )
+    const enableMatch = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)/i.exec(out)
+    const serverMatch = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/i.exec(out)
+    const enabled = enableMatch ? Number.parseInt(enableMatch[1], 16) !== 0 : false
+    const rawServer = serverMatch ? serverMatch[1].trim() : ''
+    if (enabled && rawServer) {
+      let proxyUrl = rawServer
+      if (proxyUrl.includes('=')) {
+        const httpsPart = proxyUrl.split(';').find(p => p.startsWith('https=')) || proxyUrl.split(';')[0]
+        proxyUrl = httpsPart.split('=')[1] || rawServer
+      }
+      if (!/^https?:\/\//i.test(proxyUrl) && !/^socks/i.test(proxyUrl)) {
+        proxyUrl = `http://${proxyUrl}`
+      }
+      cachedWinProxy = proxyUrl
+      return proxyUrl
+    }
+  } catch {
+    // Ignore registry query errors.
+  }
+  cachedWinProxy = ''
+  return undefined
+}
+
+function buildAgySpawnEnv(configuredProxy) {
+  const env = { ...process.env }
+  const existingProxy =
+    configuredProxy ||
+    env.HTTPS_PROXY ||
+    env.https_proxy ||
+    env.HTTP_PROXY ||
+    env.http_proxy ||
+    env.ALL_PROXY ||
+    env.all_proxy
+  const proxyUrl = existingProxy || detectWindowsSystemProxy()
+  if (proxyUrl) {
+    env.HTTP_PROXY = env.HTTP_PROXY || proxyUrl
+    env.HTTPS_PROXY = env.HTTPS_PROXY || proxyUrl
+    env.http_proxy = env.http_proxy || proxyUrl
+    env.https_proxy = env.https_proxy || proxyUrl
+    env.NO_PROXY = env.NO_PROXY || '127.0.0.1,localhost'
+  }
+  return env
+}
+
 const EMPTY_CWD = join(tmpdir(), 'dsh-agy-llm-empty')
 
 function formatContent(content) {
   if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
   const parts = []
   for (const block of content) {
-    if (block.type === 'text') {
+    if (!block || typeof block !== 'object') continue
+    if (block.type === 'text' && typeof block.text === 'string') {
       parts.push(block.text)
-    } else if (block.type === 'thinking') {
+    } else if (block.type === 'reasoning' && typeof block.text === 'string') {
+      parts.push(`<thinking>\n${block.text}\n</thinking>`)
+    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
       parts.push(`<thinking>\n${block.thinking}\n</thinking>`)
     } else if (block.type === 'tool-call') {
       parts.push(`<dsh_tool_call>{"name":${JSON.stringify(block.name)},"arguments":${block.arguments}}</dsh_tool_call>`)
@@ -52,16 +121,17 @@ function buildPrompt(options) {
   sections.push(
     '# DeepSeek Harness LLM Bridge Instructions',
     'You are acting as the underlying LLM engine for DeepSeek Harness (dsh).',
-    'IMPORTANT: Do NOT invoke your own built-in Antigravity CLI tools (such as run_command, read_file, write_file, edit_file, etc.).',
+    'IMPORTANT: Do NOT invoke your own built-in Antigravity CLI tools (such as run_command, read_file, write_file, edit_file, view_file, etc.).',
     'Instead, respond directly to the conversation below. When you need to call one of the provided dsh tools, output one or more XML blocks in the exact format:',
     '<dsh_tool_call>{"name": "tool_name", "arguments": {...}}</dsh_tool_call>',
     'When you emit a <dsh_tool_call> block, stop immediately after emitting the tool call(s) so dsh can execute them and return the <dsh_tool_result> in the next turn.',
   )
 
-  if (options.systemPrompt) {
-    const sys = typeof options.systemPrompt === 'string'
-      ? options.systemPrompt
-      : options.systemPrompt.join('\n\n')
+  const rawSystem = options.system ?? options.systemPrompt
+  if (rawSystem) {
+    const sys = typeof rawSystem === 'string'
+      ? rawSystem
+      : Array.isArray(rawSystem) ? rawSystem.join('\n\n') : ''
     if (sys.trim()) {
       sections.push(`# System Prompt\n${sys}`)
     }
@@ -77,9 +147,12 @@ function buildPrompt(options) {
   }
 
   const transcript = []
-  for (const msg of options.messages) {
+  for (const msg of options.messages || []) {
     if (msg.role === 'system') {
       transcript.push(`[SYSTEM]\n${formatContent(msg.content)}`)
+    } else if (msg.role === 'developer') {
+      const devText = formatContent(msg.content)
+      if (devText.trim()) transcript.push(`[DEVELOPER]\n${devText}`)
     } else if (msg.role === 'user') {
       transcript.push(`[USER]\n${formatContent(msg.content)}`)
     } else if (msg.role === 'assistant') {
@@ -87,7 +160,9 @@ function buildPrompt(options) {
     } else if (msg.role === 'tool') {
       const text = typeof msg.content === 'string'
         ? msg.content
-        : msg.content.map(p => (p.type === 'text' ? p.text : '[image]')).join('\n')
+        : Array.isArray(msg.content)
+          ? msg.content.map(p => (p.type === 'text' ? p.text : '[image]')).join('\n')
+          : ''
       transcript.push(
         `[TOOL RESULT (toolCallId=${msg.toolCallId}${msg.isError ? ', error=true' : ''})]\n<dsh_tool_result>\n${text}\n</dsh_tool_result>`,
       )
@@ -125,10 +200,41 @@ function extractToolCalls(rawText) {
   return { cleanText: cleanText.trim(), toolCalls }
 }
 
+function isRetryableAgyError(stderrText) {
+  const t = (stderrText || '').toLowerCase()
+  return (
+    t.includes('eof') ||
+    t.includes('eligibility check failed') ||
+    t.includes('googleapis.com') ||
+    t.includes('timeout') ||
+    t.includes('connection reset') ||
+    t.includes('forcibly closed') ||
+    t.includes('tls handshake') ||
+    t.includes('unavailable') ||
+    t.includes('rate limit') ||
+    t.includes('429') ||
+    t.includes('502') ||
+    t.includes('503')
+  )
+}
+
+function delayMs(ms, signal) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer)
+        resolve()
+      }, { once: true })
+    }
+  })
+}
+
 class AgyLlmAdapter {
-  constructor(agyBin, provider) {
+  constructor(agyBin, provider, proxyUrl) {
     this.agyBin = agyBin
     this.provider = provider
+    this.proxyUrl = proxyUrl
     this.cachedModels = null
   }
 
@@ -157,6 +263,7 @@ class AgyLlmAdapter {
       const child = spawn(this.agyBin, ['models'], {
         stdio: ['ignore', 'pipe', 'ignore'],
         windowsHide: true,
+        env: buildAgySpawnEnv(this.proxyUrl),
         signal,
       })
       let out = ''
@@ -224,146 +331,171 @@ class AgyLlmAdapter {
       options.model,
     ]
 
-    const child = spawn(this.agyBin, args, {
-      cwd: EMPTY_CWD,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    })
+    const maxAttempts = 3
+    let lastError = null
 
-    const onAbort = () => {
-      child.kill()
-    }
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-
-    child.stdin.write(prompt, 'utf8')
-    child.stdin.end()
-
-    let stderrText = ''
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk) => {
-      stderrText += chunk
-    })
-
-    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity })
-
-    let fullResponse = ''
-    let streamedText = ''
-    let textBlockStarted = false
-    let inputTokens = 0
-    let outputTokens = 0
-
-    try {
-      for await (const line of rl) {
-        const trimmed = line.trim()
-        if (!trimmed.startsWith('{')) continue
-        let parsed
-        try {
-          parsed = JSON.parse(trimmed)
-        } catch {
-          continue
-        }
-
-        if (parsed.event === 'step_update' && parsed.step_update) {
-          const step = parsed.step_update
-          if (step.usage) {
-            if (typeof step.usage.input_tokens === 'number') inputTokens = step.usage.input_tokens
-            if (typeof step.usage.output_tokens === 'number') outputTokens = step.usage.output_tokens
-          }
-          if (step.step_type === 'agent_response' && typeof step.text_delta === 'string' && step.text_delta.length > 0) {
-            fullResponse += step.text_delta
-            if (!fullResponse.includes('<dsh_tool_call')) {
-              if (!textBlockStarted) {
-                textBlockStarted = true
-                yield { type: 'block-start', index: 0, blockType: 'text' }
-              }
-              streamedText += step.text_delta
-              yield { type: 'text-delta', index: 0, text: step.text_delta }
-            }
-          }
-        } else if (parsed.event === 'result' && parsed.result) {
-          const res = parsed.result
-          if (typeof res.response === 'string' && res.response.length > 0 && fullResponse.length === 0) {
-            fullResponse = res.response
-          }
-          if (res.usage) {
-            if (typeof res.usage.input_tokens === 'number') inputTokens = res.usage.input_tokens
-            if (typeof res.usage.output_tokens === 'number') outputTokens = res.usage.output_tokens
-          }
-        }
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (options.signal?.aborted) {
+        break
       }
 
-      const exitCode = await new Promise((resolve) => {
-        if (child.exitCode !== null) {
-          resolve(child.exitCode)
-          return
-        }
-        child.once('close', code => resolve(code ?? 1))
-        child.once('error', () => resolve(1))
+      const child = spawn(this.agyBin, args, {
+        cwd: EMPTY_CWD,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: buildAgySpawnEnv(this.proxyUrl),
       })
 
-      if (exitCode !== 0 && fullResponse.length === 0) {
-        const err = new Error(`agy CLI exited with code ${exitCode}: ${stderrText.trim() || 'no output'}`)
-        err.code = 'AGY_CLI_ERROR'
-        throw err
+      const onAbort = () => {
+        try { child.kill() } catch {}
+      }
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+
+      child.stdin.on('error', () => {})
+      try {
+        child.stdin.write(prompt, 'utf8')
+        child.stdin.end()
+      } catch {
+        // Ignore early stdin close if agy exits immediately.
       }
 
-      const { cleanText, toolCalls } = extractToolCalls(fullResponse)
-      let nextIndex = 0
+      let stderrText = ''
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (chunk) => {
+        stderrText += chunk
+      })
 
-      if (textBlockStarted) {
-        yield {
-          type: 'block-end',
-          index: 0,
-          block: { type: 'text', text: cleanText || streamedText },
-        }
-        nextIndex = 1
-      } else if (cleanText.length > 0) {
-        yield { type: 'block-start', index: 0, blockType: 'text' }
-        yield { type: 'text-delta', index: 0, text: cleanText }
-        yield {
-          type: 'block-end',
-          index: 0,
-          block: { type: 'text', text: cleanText },
-        }
-        nextIndex = 1
-      }
+      const rl = createInterface({ input: child.stdout, crlfDelay: Infinity })
 
-      for (let i = 0; i < toolCalls.length; i++) {
-        const tc = toolCalls[i]
-        const idx = nextIndex + i
-        const callId = `agy-call-${Date.now()}-${i}`
-        yield { type: 'block-start', index: idx, blockType: 'tool-call' }
-        yield {
-          type: 'tool-call-delta',
-          index: idx,
-          id: callId,
-          name: tc.name,
-          argumentsDelta: tc.arguments,
+      let fullResponse = ''
+      let streamedText = ''
+      let textBlockStarted = false
+      let inputTokens = 0
+      let outputTokens = 0
+
+      try {
+        for await (const line of rl) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('{')) continue
+          let parsed
+          try {
+            parsed = JSON.parse(trimmed)
+          } catch {
+            continue
+          }
+
+          if (parsed.event === 'step_update' && parsed.step_update) {
+            const step = parsed.step_update
+            if (step.usage) {
+              if (typeof step.usage.input_tokens === 'number') inputTokens = step.usage.input_tokens
+              if (typeof step.usage.output_tokens === 'number') outputTokens = step.usage.output_tokens
+            }
+            if (step.step_type === 'agent_response' && typeof step.text_delta === 'string' && step.text_delta.length > 0) {
+              fullResponse += step.text_delta
+              if (!fullResponse.includes('<dsh_tool_call')) {
+                if (!textBlockStarted) {
+                  textBlockStarted = true
+                  yield { type: 'block-start', index: 0, blockType: 'text' }
+                }
+                streamedText += step.text_delta
+                yield { type: 'text-delta', index: 0, text: step.text_delta }
+              }
+            }
+          } else if (parsed.event === 'result' && parsed.result) {
+            const res = parsed.result
+            if (typeof res.response === 'string' && res.response.length > 0 && fullResponse.length === 0) {
+              fullResponse = res.response
+            }
+            if (res.usage) {
+              if (typeof res.usage.input_tokens === 'number') inputTokens = res.usage.input_tokens
+              if (typeof res.usage.output_tokens === 'number') outputTokens = res.usage.output_tokens
+            }
+          }
         }
-        yield {
-          type: 'block-end',
-          index: idx,
-          block: {
-            type: 'tool-call',
+
+        const exitCode = await new Promise((resolve) => {
+          if (child.exitCode !== null) {
+            resolve(child.exitCode)
+            return
+          }
+          child.once('close', code => resolve(code ?? 1))
+          child.once('error', () => resolve(1))
+        })
+
+        if (exitCode !== 0 && fullResponse.length === 0) {
+          const err = new Error(`agy CLI exited with code ${exitCode}: ${stderrText.trim() || 'no output'}`)
+          err.code = 'AGY_CLI_ERROR'
+          lastError = err
+          if (!textBlockStarted && attempt < maxAttempts && isRetryableAgyError(stderrText) && !options.signal?.aborted) {
+            await delayMs(attempt * 500, options.signal)
+            continue
+          }
+          throw err
+        }
+
+        const { cleanText, toolCalls } = extractToolCalls(fullResponse)
+        let nextIndex = 0
+
+        if (textBlockStarted) {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: { type: 'text', text: cleanText || streamedText },
+          }
+          nextIndex = 1
+        } else if (cleanText.length > 0) {
+          yield { type: 'block-start', index: 0, blockType: 'text' }
+          yield { type: 'text-delta', index: 0, text: cleanText }
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: { type: 'text', text: cleanText },
+          }
+          nextIndex = 1
+        }
+
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i]
+          const idx = nextIndex + i
+          const callId = `agy-call-${Date.now()}-${i}`
+          yield { type: 'block-start', index: idx, blockType: 'tool-call' }
+          yield {
+            type: 'tool-call-delta',
+            index: idx,
             id: callId,
             name: tc.name,
-            arguments: tc.arguments,
-          },
+            argumentsDelta: tc.arguments,
+          }
+          yield {
+            type: 'block-end',
+            index: idx,
+            block: {
+              type: 'tool-call',
+              id: callId,
+              name: tc.name,
+              arguments: tc.arguments,
+            },
+          }
         }
-      }
 
-      yield {
-        type: 'usage',
-        usage: { inputTokens, outputTokens },
-      }
+        yield {
+          type: 'usage',
+          usage: { inputTokens, outputTokens },
+        }
 
-      yield {
-        type: 'finish',
-        reason: toolCalls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
+        yield {
+          type: 'finish',
+          reason: toolCalls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
+        }
+        return
+      } finally {
+        options.signal?.removeEventListener('abort', onAbort)
+        rl.close()
       }
-    } finally {
-      options.signal?.removeEventListener('abort', onAbort)
-      rl.close()
+    }
+
+    if (lastError) {
+      throw lastError
     }
   }
 }
@@ -374,6 +506,7 @@ export const inject = ['llm']
 export function apply(ctx, config = {}) {
   const agyBin = config.agyBin || resolveDefaultAgyBin()
   const provider = config.provider || 'agy'
-  const adapter = new AgyLlmAdapter(agyBin, provider)
-  ctx.llm.registerAdapter([provider], adapter)
+  const proxyUrl = config.proxyUrl || config.proxy || undefined
+  const adapter = new AgyLlmAdapter(agyBin, provider, proxyUrl)
+  ctx.effect(() => ctx.llm.registerAdapter([provider], adapter))
 }
